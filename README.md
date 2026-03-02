@@ -11,6 +11,7 @@ A fast, minimal image viewer for macOS designed to be launched from the terminal
 - **Zoom** — `+` / `-` keys or trackpad pinch; `f` returns to fit-to-window; `o` resets to 1:1 pixels
 - **Pan** — drag with the mouse when zoomed in, or use `Shift` + arrow keys
 - **Delete** — `Backspace` / `Delete` moves the current file to Trash (with confirmation); falls back to permanent delete for network drives
+- **Thumbnail grid** — press `Space` or `↑` to open a full-screen grid of all images in the folder; navigate with arrow keys, open with `Enter` or double-click
 - **Dual keyboard input** — reads keys both from the GUI window and directly from the terminal stdin, so all shortcuts work even if the terminal stays focused after launch (no need to click the window)
 - **Robust filesystem support** — handles Cyrillic and Unicode filenames correctly on local HFS+, NFS, and other network filesystems
 
@@ -20,10 +21,13 @@ A fast, minimal image viewer for macOS designed to be launched from the terminal
 
 ## Keyboard shortcuts
 
+### Single-image view
+
 | Key | Action |
 |-----|--------|
 | `Esc` | Quit |
 | `←` / `→` | Previous / next image |
+| `Space` or `↑` | Open thumbnail grid |
 | `+` or `=` | Zoom in |
 | `-` | Zoom out |
 | `f` (or `а`) | Fit to window |
@@ -31,6 +35,18 @@ A fast, minimal image viewer for macOS designed to be launched from the terminal
 | `Shift` + arrows | Pan the image |
 | `Backspace` / `Delete` | Move current file to Trash |
 | `Cmd+Q` | Quit |
+
+### Thumbnail grid
+
+| Key | Action |
+|-----|--------|
+| `Esc` | Quit |
+| `Space` | Close grid, return to image |
+| `←` / `→` / `↑` / `↓` | Navigate thumbnails |
+| `Enter` | Open selected image |
+| `+` or `=` | Larger thumbnails (fewer columns) |
+| `-` | Smaller thumbnails (more columns) |
+| `Backspace` / `Delete` | Move selected file to Trash |
 
 Keys in parentheses are their Russian-layout equivalents — the same physical key works regardless of which keyboard layout is active.
 
@@ -122,6 +138,7 @@ Sources/imgDirView/
 ├── ImageWindowController.swift Window, keyboard handling, status bar, delete confirmation
 ├── ZoomableImageView.swift     Custom NSView: draw, zoom, pan, pinch
 ├── ImageNavigator.swift        POSIX directory scan, file list, background preloading
+├── ThumbnailBrowserView.swift  Full-screen grid overlay with async thumbnail loading
 └── TerminalKeyReader.swift     Raw stdin key reading — works without GUI focus
 ```
 

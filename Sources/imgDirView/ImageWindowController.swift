@@ -8,9 +8,13 @@ final class ImageWindowController: NSObject {
 
     private var imageView: ZoomableImageView!
     private var statusBar: StatusBarView!
+    private var thumbnailBrowser: ThumbnailBrowserView!
     private var navigator: ImageNavigator!
     private var keyMonitor: Any?
     private let terminalKeys = TerminalKeyReader()
+
+    private enum ViewMode { case single, grid }
+    private var viewMode: ViewMode = .single
 
     // Retained for status bar refresh on zoom change
     private var currentIndex: Int = 0
@@ -73,6 +77,16 @@ final class ImageWindowController: NSObject {
         statusBar.autoresizingMask = [.width, .maxYMargin]
         content.addSubview(statusBar)
 
+        thumbnailBrowser = ThumbnailBrowserView(frame: content.bounds)
+        thumbnailBrowser.autoresizingMask = [.width, .height]
+        thumbnailBrowser.alphaValue = 0
+        thumbnailBrowser.isHidden = true
+        content.addSubview(thumbnailBrowser)
+
+        thumbnailBrowser.onOpen    = { [weak self] index in self?.openFromGrid(index: index) }
+        thumbnailBrowser.onDismiss = { [weak self] in self?.hideGrid() }
+        thumbnailBrowser.onDelete  = { [weak self] index in self?.confirmAndMoveToTrashFromGrid(index: index) }
+
         imageView.onZoomChanged = { [weak self] in
             self?.refreshStatus()
         }
@@ -94,21 +108,75 @@ final class ImageWindowController: NSObject {
                          filename: name, zoom: imageView.currentScaleInfo)
     }
 
+    // MARK: - Grid show / hide
+
+    private func showGrid() {
+        viewMode = .grid
+        thumbnailBrowser.isHidden = false
+        thumbnailBrowser.load(rawPaths: navigator.allRawPaths, selectedIndex: navigator.index)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            thumbnailBrowser.animator().alphaValue = 1.0
+        }
+    }
+
+    private func hideGrid() {
+        viewMode = .single
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.10
+            thumbnailBrowser.animator().alphaValue = 0.0
+        }, completionHandler: {
+            self.thumbnailBrowser.isHidden = true
+        })
+    }
+
+    private func openFromGrid(index: Int) {
+        navigator.jumpTo(index: index)
+        navigator.loadCurrent()
+        hideGrid()
+    }
+
     // MARK: - Terminal Key Handling (works when GUI focus is elsewhere)
 
     private func installTerminalKeyHandler() {
         terminalKeys.onAction = { [weak self] action in
             guard let self else { return }
             switch action {
-            case .quit:              NSApp.terminate(nil)
-            case .previousImage:     self.navigator.goToPrevious()
-            case .nextImage:         self.navigator.goToNext()
-            case .zoomIn:            self.imageView.zoomIn()
-            case .zoomOut:           self.imageView.zoomOut()
-            case .resetZoom:         self.imageView.resetToOriginalSize()
-            case .fitToWindow:       self.imageView.resetToFit()
-            case .deleteFile:        self.confirmAndMoveToTrash()
-            case .pan(let dx, let dy): self.imageView.pan(dx: dx, dy: dy)
+            case .quit:
+                NSApp.terminate(nil)
+            case .toggleGrid:
+                // Up arrow: show grid in single mode, navigate up in grid mode
+                if self.viewMode == .single { self.showGrid() }
+                else { self.thumbnailBrowser.handleKey(126, shift: false) }
+            case .navigateDown:
+                if self.viewMode == .grid {
+                    self.thumbnailBrowser.handleKey(125, shift: false)
+                }
+            case .confirmSelect:
+                if self.viewMode == .grid {
+                    self.openFromGrid(index: self.thumbnailBrowser.currentSelectedIndex)
+                }
+            case .previousImage:
+                if self.viewMode == .single { self.navigator.goToPrevious() }
+                else { self.thumbnailBrowser.handleKey(123, shift: false) }
+            case .nextImage:
+                if self.viewMode == .single { self.navigator.goToNext() }
+                else { self.thumbnailBrowser.handleKey(124, shift: false) }
+            case .zoomIn:
+                if self.viewMode == .single { self.imageView.zoomIn() }
+                else { self.thumbnailBrowser.handleKey(24, shift: false) }
+            case .zoomOut:
+                if self.viewMode == .single { self.imageView.zoomOut() }
+                else { self.thumbnailBrowser.handleKey(27, shift: false) }
+            case .resetZoom:
+                if self.viewMode == .single { self.imageView.resetToOriginalSize() }
+            case .fitToWindow:
+                if self.viewMode == .single { self.imageView.resetToFit() }
+            case .deleteFile:
+                if self.viewMode == .single { self.confirmAndMoveToTrash() }
+                else { self.confirmAndMoveToTrashFromGrid(index: self.thumbnailBrowser.currentSelectedIndex) }
+            case .pan(let dx, let dy):
+                if self.viewMode == .single { self.imageView.pan(dx: dx, dy: dy) }
             }
         }
         terminalKeys.start()
@@ -130,11 +198,22 @@ final class ImageWindowController: NSObject {
         // Let Command+key combos through (Cmd+Q, Cmd+W handled by AppKit/menu)
         if event.modifierFlags.contains(.command) { return false }
 
+        // Esc always quits regardless of mode
+        if event.keyCode == 53 { NSApp.terminate(nil); return true }
+
         let shift = event.modifierFlags.contains(.shift)
 
-        switch event.keyCode {
-        case 53: // Esc
-            NSApp.terminate(nil)
+        switch viewMode {
+        case .single: return handleSingleKey(keyCode: event.keyCode, shift: shift)
+        case .grid:   return thumbnailBrowser.handleKey(event.keyCode, shift: shift)
+        }
+    }
+
+    @discardableResult
+    private func handleSingleKey(keyCode: UInt16, shift: Bool) -> Bool {
+        switch keyCode {
+        case 49: // Space → open grid
+            showGrid()
             return true
 
         case 123: // ← Left arrow
@@ -149,6 +228,7 @@ final class ImageWindowController: NSObject {
 
         case 126: // ↑ Up arrow
             if shift { imageView.pan(dx: 0, dy: -40) }
+            else { showGrid() }
             return true
 
         case 125: // ↓ Down arrow
@@ -181,7 +261,7 @@ final class ImageWindowController: NSObject {
         }
     }
 
-    // MARK: - Delete / Trash
+    // MARK: - Delete / Trash (single-image mode)
 
     private func confirmAndMoveToTrash() {
         guard let rawPath = navigator.currentRawPath else { return }
@@ -229,6 +309,53 @@ final class ImageWindowController: NSObject {
             // No more images in directory
             NSApp.terminate(nil)
         }
+    }
+
+    // MARK: - Delete / Trash (grid mode)
+
+    private func confirmAndMoveToTrashFromGrid(index: Int) {
+        let paths = navigator.allRawPaths
+        guard index >= 0, index < paths.count else { return }
+        let rawPath = paths[index]
+        let filename = (rawPath as NSString).lastPathComponent
+
+        let alert = NSAlert()
+        alert.messageText = "Move to Trash?"
+        alert.informativeText = filename
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let url = URL(fileURLWithPath: rawPath)
+        if (try? FileManager.default.trashItem(at: url, resultingItemURL: nil)) != nil {
+            removeFromGrid(index: index)
+            return
+        }
+
+        let fallback = NSAlert()
+        fallback.messageText = "Cannot Move to Trash"
+        fallback.informativeText = "The file may be on a network drive. Permanently delete \"\(filename)\"?"
+        fallback.addButton(withTitle: "Delete Permanently")
+        fallback.addButton(withTitle: "Cancel")
+        fallback.alertStyle = .critical
+        guard fallback.runModal() == .alertFirstButtonReturn else { return }
+
+        let result = rawPath.withCString { Darwin.unlink($0) }
+        if result == 0 {
+            removeFromGrid(index: index)
+        } else {
+            let err = NSAlert()
+            err.messageText = "Cannot Delete File"
+            err.informativeText = String(cString: strerror(errno))
+            err.runModal()
+        }
+    }
+
+    private func removeFromGrid(index: Int) {
+        navigator.removeAt(index: index)
+        thumbnailBrowser.removeItem(at: index)
+        if navigator.count == 0 { NSApp.terminate(nil) }
     }
 }
 

@@ -109,6 +109,24 @@ final class ImageNavigator {
     var count: Int { rawPaths.count }
     var index: Int { currentIndex }
     var currentRawPath: String? { rawPaths.isEmpty ? nil : rawPaths[currentIndex] }
+    var allRawPaths: [String] { rawPaths }
+
+    func jumpTo(index: Int) {
+        guard index >= 0, index < rawPaths.count else { return }
+        currentIndex = index
+    }
+
+    /// Remove the file at a given index. Does NOT call loadCurrent() — caller is responsible.
+    /// Returns false if the list is now empty.
+    @discardableResult
+    func removeAt(index: Int) -> Bool {
+        guard index >= 0, index < rawPaths.count else { return !rawPaths.isEmpty }
+        rawPaths.remove(at: index)
+        urls.remove(at: index)
+        cacheQueue.async(flags: .barrier) { self.cache = [:] }
+        if currentIndex >= rawPaths.count { currentIndex = max(0, rawPaths.count - 1) }
+        return !rawPaths.isEmpty
+    }
 
     func loadCurrent() {
         let idx = currentIndex

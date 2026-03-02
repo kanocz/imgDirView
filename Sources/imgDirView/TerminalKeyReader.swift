@@ -11,6 +11,9 @@ final class TerminalKeyReader {
         case previousImage, nextImage
         case zoomIn, zoomOut, resetZoom, fitToWindow
         case deleteFile
+        case toggleGrid
+        case navigateDown
+        case confirmSelect
         case pan(dx: CGFloat, dy: CGFloat)
     }
 
@@ -76,12 +79,14 @@ final class TerminalKeyReader {
         // Single-byte keys
         if bytes.count == 1 {
             switch bytes[0] {
-            case 0x1B:        return .quit         // Esc (lone — not part of a sequence)
-            case 0x7F:        return .deleteFile   // Backspace (DEL in terminal)
-            case 0x2B, 0x3D:  return .zoomIn       // + or =
-            case 0x2D:        return .zoomOut       // -
-            case 0x6F, 0x4F:  return .resetZoom    // o / O
-            case 0x66, 0x46:  return .fitToWindow  // f / F
+            case 0x1B:        return .quit           // Esc (lone — not part of a sequence)
+            case 0x7F:        return .deleteFile     // Backspace (DEL in terminal)
+            case 0x20:        return .toggleGrid     // Space
+            case 0x0D, 0x0A:  return .confirmSelect  // Enter / Return
+            case 0x2B, 0x3D:  return .zoomIn         // + or =
+            case 0x2D:        return .zoomOut        // -
+            case 0x6F, 0x4F:  return .resetZoom      // o / O
+            case 0x66, 0x46:  return .fitToWindow    // f / F
             default:          return nil
             }
         }
@@ -93,8 +98,8 @@ final class TerminalKeyReader {
                 switch bytes[2] {
                 case 0x43: return .nextImage           // → right
                 case 0x44: return .previousImage       // ← left
-                case 0x41: return nil                  // ↑ up  (no action without shift)
-                case 0x42: return nil                  // ↓ down
+                case 0x41: return .toggleGrid          // ↑ up
+                case 0x42: return .navigateDown        // ↓ down
                 default:   return nil
                 }
             }
