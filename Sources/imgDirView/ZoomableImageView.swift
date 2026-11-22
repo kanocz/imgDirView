@@ -15,6 +15,20 @@ final class ZoomableImageView: NSView {
 
     private var lastDragPoint: NSPoint?
 
+    // 16pt tile of 8pt white and light-gray squares, drawn under images that have an alpha channel
+    private static let checkerboard: NSColor = {
+        let s: CGFloat = 8
+        let tile = NSImage(size: NSSize(width: s * 2, height: s * 2), flipped: false) { rect in
+            NSColor.white.setFill()
+            rect.fill()
+            NSColor(white: 0.8, alpha: 1).setFill()
+            NSRect(x: 0, y: 0, width: s, height: s).fill()
+            NSRect(x: s, y: s, width: s, height: s).fill()
+            return true
+        }
+        return NSColor(patternImage: tile)
+    }()
+
     // MARK: - Public interface
 
     var currentScaleInfo: String {
@@ -109,6 +123,12 @@ final class ZoomableImageView: NSView {
         let y = (bounds.height - drawSize.height) / 2 + (isFitMode ? 0 : panOffset.y)
 
         let drawRect = CGRect(origin: CGPoint(x: x, y: y), size: drawSize)
+
+        // Opaque images skip the checkerboard: it would show as a light fringe on antialiased edges.
+        if image.representations.contains(where: { $0.hasAlpha }) {
+            Self.checkerboard.setFill()
+            drawRect.intersection(bounds).fill()
+        }
 
         NSGraphicsContext.current?.imageInterpolation = scale < 1 ? .high : .default
         image.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1.0)
