@@ -271,7 +271,19 @@ final class ThumbnailBrowserView: NSView {
             kCGImageSourceCreateThumbnailWithTransform: true
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        let size = NSSize(width: cg.width, height: cg.height)
+        switch cg.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast:
+            return NSImage(cgImage: cg, size: size)
+        default:
+            // Has an alpha channel: bake the checkerboard under the thumbnail
+            return NSImage(size: size, flipped: false) { rect in
+                NSColor.checkerboard.setFill()
+                rect.fill()
+                NSGraphicsContext.current?.cgContext.draw(cg, in: rect)
+                return true
+            }
+        }
     }
 
     // MARK: - Double-click

@@ -15,20 +15,6 @@ final class ZoomableImageView: NSView {
 
     private var lastDragPoint: NSPoint?
 
-    // 16pt tile of 8pt white and light-gray squares, drawn under images that have an alpha channel
-    private static let checkerboard: NSColor = {
-        let s: CGFloat = 8
-        let tile = NSImage(size: NSSize(width: s * 2, height: s * 2), flipped: false) { rect in
-            NSColor.white.setFill()
-            rect.fill()
-            NSColor(white: 0.8, alpha: 1).setFill()
-            NSRect(x: 0, y: 0, width: s, height: s).fill()
-            NSRect(x: s, y: s, width: s, height: s).fill()
-            return true
-        }
-        return NSColor(patternImage: tile)
-    }()
-
     // MARK: - Public interface
 
     var currentScaleInfo: String {
@@ -126,7 +112,7 @@ final class ZoomableImageView: NSView {
 
         // Opaque images skip the checkerboard: it would show as a light fringe on antialiased edges.
         if image.representations.contains(where: { $0.hasAlpha }) {
-            Self.checkerboard.setFill()
+            NSColor.checkerboard.setFill()
             drawRect.intersection(bounds).fill()
         }
 
@@ -214,6 +200,24 @@ final class ZoomableImageView: NSView {
     private func resetCursorIfNeeded() {
         window?.invalidateCursorRects(for: self)
     }
+}
+
+// MARK: - Transparency checkerboard
+
+extension NSColor {
+    /// 16pt tile of 8pt white and light-gray squares, drawn under images that have an alpha channel.
+    static let checkerboard: NSColor = {
+        let s: CGFloat = 8
+        let tile = NSImage(size: NSSize(width: s * 2, height: s * 2), flipped: false) { rect in
+            NSColor.white.setFill()
+            rect.fill()
+            NSColor(white: 0.8, alpha: 1).setFill()
+            NSRect(x: 0, y: 0, width: s, height: s).fill()
+            NSRect(x: s, y: s, width: s, height: s).fill()
+            return true
+        }
+        return NSColor(patternImage: tile)
+    }()
 }
 
 // MARK: - Comparable clamping helper
