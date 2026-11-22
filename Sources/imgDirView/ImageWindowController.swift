@@ -20,13 +20,17 @@ final class ImageWindowController: NSObject {
     private var currentIndex: Int = 0
     private var currentTotal: Int = 1
     private var currentURL: URL?
+    // Byte-exact key (String.rawKey) of the file the view currently shows, or failed to show
+    private var displayedKey: Data?
+    private enum LoadState { case loading, loaded, failed }
+    private var loadState: LoadState = .loading
 
     // MARK: - Init
 
     init(imageURL: URL, rawPath: String) {
-        let screen = NSScreen.main ?? NSScreen.screens[0]
         // visibleFrame excludes menu bar + Dock — fills the usable desktop
-        let frame = screen.visibleFrame
+        let frame = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
 
         window = NSWindow(
             contentRect: frame,
@@ -50,6 +54,11 @@ final class ImageWindowController: NSObject {
 
     deinit {
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
+        terminalKeys.stop()
+    }
+
+    /// Restore the terminal. Called from applicationWillTerminate, because exit() runs no deinit.
+    func shutdown() {
         terminalKeys.stop()
     }
 
@@ -85,7 +94,7 @@ final class ImageWindowController: NSObject {
 
         thumbnailBrowser.onOpen    = { [weak self] index in self?.openFromGrid(index: index) }
         thumbnailBrowser.onDismiss = { [weak self] in self?.hideGrid() }
-        thumbnailBrowser.onDelete  = { [weak self] index in self?.confirmAndMoveToTrashFromGrid(index: index) }
+        thumbnailBrowser.onDelete  = { [weak self] index in self?.confirmAndDelete(index: index) }
 
         imageView.onZoomChanged = { [weak self] in
             self?.refreshStatus()
@@ -96,6 +105,11 @@ final class ImageWindowController: NSObject {
 
     private func setupNavigator(startURL: URL, rawPath: String) {
         navigator = ImageNavigator(startURL: startURL, rawPath: rawPath)
+        // Only a directory argument can produce an empty list. The terminal is not in raw mode yet.
+        guard navigator.count > 0 else {
+            fputs("No images in \(rawPath)\n", stderr)
+            exit(1)
+        }
         navigator.delegate = self
         navigator.loadCurrent()
     }
@@ -103,9 +117,16 @@ final class ImageWindowController: NSObject {
     // MARK: - Status
 
     private func refreshStatus() {
-        let name = currentURL?.lastPathComponent ?? ""
-        statusBar.update(index: currentIndex, total: currentTotal,
-                         filename: name, zoom: imageView.currentScaleInfo)
+        // Nothing to report until the first load has finished
+        guard let name = currentURL?.lastPathComponent else { return }
+        // The zoom of the picture on screen applies only when that picture belongs to this file
+        let zoom: String
+        switch loadState {
+        case .loading: zoom = "Loading…"
+        case .loaded:  zoom = imageView.currentScaleInfo
+        case .failed:  zoom = "— Error loading image —"
+        }
+        statusBar.update(index: currentIndex, total: currentTotal, filename: name, zoom: zoom)
     }
 
     // MARK: - Grid show / hide
@@ -125,7 +146,9 @@ final class ImageWindowController: NSObject {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.10
             thumbnailBrowser.animator().alphaValue = 0.0
-        }, completionHandler: {
+        }, completionHandler: { [weak self] in
+            // The grid may have been reopened during the fade-out
+            guard let self, self.viewMode == .single else { return }
             self.thumbnailBrowser.isHidden = true
         })
     }
@@ -141,10 +164,15 @@ final class ImageWindowController: NSObject {
     private func installTerminalKeyHandler() {
         terminalKeys.onAction = { [weak self] action in
             guard let self else { return }
+            // An alert is up: it owns the keyboard, same rule as in handleKey
+            guard NSApp.modalWindow == nil else { return }
             switch action {
             case .quit:
                 NSApp.terminate(nil)
             case .toggleGrid:
+                // Space: open the grid, or close it, same as in the GUI
+                if self.viewMode == .single { self.showGrid() } else { self.hideGrid() }
+            case .navigateUp:
                 // Up arrow: show grid in single mode, navigate up in grid mode
                 if self.viewMode == .single { self.showGrid() }
                 else { self.thumbnailBrowser.handleKey(126, shift: false) }
@@ -173,8 +201,8 @@ final class ImageWindowController: NSObject {
             case .fitToWindow:
                 if self.viewMode == .single { self.imageView.resetToFit() }
             case .deleteFile:
-                if self.viewMode == .single { self.confirmAndMoveToTrash() }
-                else { self.confirmAndMoveToTrashFromGrid(index: self.thumbnailBrowser.currentSelectedIndex) }
+                if self.viewMode == .single { self.confirmAndDeleteCurrent() }
+                else { self.confirmAndDelete(index: self.thumbnailBrowser.currentSelectedIndex) }
             case .pan(let dx, let dy):
                 if self.viewMode == .single { self.imageView.pan(dx: dx, dy: dy) }
             }
@@ -253,7 +281,7 @@ final class ImageWindowController: NSObject {
 
         case 51,  // ⌫ Backspace
              117: // ⌦ Forward Delete
-            confirmAndMoveToTrash()
+            confirmAndDeleteCurrent()
             return true
 
         default:
@@ -261,11 +289,49 @@ final class ImageWindowController: NSObject {
         }
     }
 
-    // MARK: - Delete / Trash (single-image mode)
+    // MARK: - Delete / Trash
 
-    private func confirmAndMoveToTrash() {
-        guard let rawPath = navigator.currentRawPath else { return }
+    /// Single-image mode: delete the file on screen.
+    private func confirmAndDeleteCurrent() {
+        // While the next image is still loading the view shows the previous file; deleting
+        // now would remove a file the user is not looking at.
+        guard let rawPath = navigator.currentRawPath, rawPath.rawKey == displayedKey else {
+            NSSound.beep()
+            return
+        }
+        confirmAndDelete(index: navigator.index)
+    }
+
+    private func confirmAndDelete(index: Int) {
+        let paths = navigator.allRawPaths
+        guard index >= 0, index < paths.count else { return }
+        guard trashOrDelete(rawPath: paths[index]) else { return }
+
+        // Every input path that could change the list is blocked while an alert is up
+        // (see handleKey and installTerminalKeyHandler), so `index` is still valid.
+        navigator.removeAt(index: index)
+        if viewMode == .grid { thumbnailBrowser.removeItem(at: index) }
+        if navigator.count == 0 {
+            NSApp.terminate(nil)
+        } else if navigator.currentRawPath?.rawKey != displayedKey {
+            // Also in grid mode: the image under the grid must match the navigator again
+            navigator.loadCurrent()
+        } else {
+            // Another file was deleted in the grid: the file on screen keeps its zoom,
+            // only its position and the total change
+            currentIndex = navigator.index
+            currentTotal = navigator.count
+            refreshStatus()
+        }
+    }
+
+    /// Asks for confirmation, then trashes or deletes the file. Returns true if the file is gone.
+    private func trashOrDelete(rawPath: String) -> Bool {
         let filename = (rawPath as NSString).lastPathComponent
+
+        // The key may have come from the terminal while it has the focus. Terminal keys are
+        // dropped during an alert, so the app takes the focus to let Return and Esc answer it.
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
 
         let alert = NSAlert()
         alert.messageText = "Move to Trash?"
@@ -273,14 +339,11 @@ final class ImageWindowController: NSObject {
         alert.addButton(withTitle: "Move to Trash")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
 
         // Try standard macOS Trash first (works on local volumes)
         let url = URL(fileURLWithPath: rawPath)
-        if (try? FileManager.default.trashItem(at: url, resultingItemURL: nil)) != nil {
-            advanceAfterDelete()
-            return
-        }
+        if (try? FileManager.default.trashItem(at: url, resultingItemURL: nil)) != nil { return true }
 
         // Fallback for network drives (NFS, SMB) where Trash is unavailable:
         // offer permanent deletion using a raw POSIX unlink() to bypass
@@ -291,71 +354,16 @@ final class ImageWindowController: NSObject {
         fallback.addButton(withTitle: "Delete Permanently")
         fallback.addButton(withTitle: "Cancel")
         fallback.alertStyle = .critical
-        guard fallback.runModal() == .alertFirstButtonReturn else { return }
+        guard fallback.runModal() == .alertFirstButtonReturn else { return false }
 
-        let result = rawPath.withCString { Darwin.unlink($0) }
-        if result == 0 {
-            advanceAfterDelete()
-        } else {
-            let err = NSAlert()
-            err.messageText = "Cannot Delete File"
-            err.informativeText = String(cString: strerror(errno))
-            err.runModal()
-        }
-    }
+        let unlinkError = rawPath.withCString { Darwin.unlink($0) == 0 ? 0 : errno }
+        if unlinkError == 0 { return true }
 
-    private func advanceAfterDelete() {
-        if !navigator.removeCurrentAndLoad() {
-            // No more images in directory
-            NSApp.terminate(nil)
-        }
-    }
-
-    // MARK: - Delete / Trash (grid mode)
-
-    private func confirmAndMoveToTrashFromGrid(index: Int) {
-        let paths = navigator.allRawPaths
-        guard index >= 0, index < paths.count else { return }
-        let rawPath = paths[index]
-        let filename = (rawPath as NSString).lastPathComponent
-
-        let alert = NSAlert()
-        alert.messageText = "Move to Trash?"
-        alert.informativeText = filename
-        alert.addButton(withTitle: "Move to Trash")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let url = URL(fileURLWithPath: rawPath)
-        if (try? FileManager.default.trashItem(at: url, resultingItemURL: nil)) != nil {
-            removeFromGrid(index: index)
-            return
-        }
-
-        let fallback = NSAlert()
-        fallback.messageText = "Cannot Move to Trash"
-        fallback.informativeText = "The file may be on a network drive. Permanently delete \"\(filename)\"?"
-        fallback.addButton(withTitle: "Delete Permanently")
-        fallback.addButton(withTitle: "Cancel")
-        fallback.alertStyle = .critical
-        guard fallback.runModal() == .alertFirstButtonReturn else { return }
-
-        let result = rawPath.withCString { Darwin.unlink($0) }
-        if result == 0 {
-            removeFromGrid(index: index)
-        } else {
-            let err = NSAlert()
-            err.messageText = "Cannot Delete File"
-            err.informativeText = String(cString: strerror(errno))
-            err.runModal()
-        }
-    }
-
-    private func removeFromGrid(index: Int) {
-        navigator.removeAt(index: index)
-        thumbnailBrowser.removeItem(at: index)
-        if navigator.count == 0 { NSApp.terminate(nil) }
+        let err = NSAlert()
+        err.messageText = "Cannot Delete File"
+        err.informativeText = String(cString: strerror(unlinkError))
+        err.runModal()
+        return false
     }
 }
 
@@ -370,10 +378,24 @@ extension ImageWindowController: NSWindowDelegate {
 // MARK: - ImageNavigatorDelegate
 
 extension ImageWindowController: ImageNavigatorDelegate {
-    func navigator(didLoad image: NSImage, index: Int, total: Int, url: URL) {
+    func navigator(willLoadAt index: Int, total: Int, url: URL) {
+        // Show position and name at once: on a slow disk a held arrow key would otherwise
+        // leave the status bar frozen until the key is released
         currentIndex = index
         currentTotal = total
         currentURL = url
+        loadState = .loading
+        refreshStatus()
+    }
+
+    func navigator(didLoad image: NSImage, index: Int, total: Int, url: URL) {
+        // Two queued requests for one file both deliver; the repeat must not reset the zoom
+        if loadState == .loaded, displayedKey == navigator.currentRawPath?.rawKey { return }
+        currentIndex = index
+        currentTotal = total
+        currentURL = url
+        displayedKey = navigator.currentRawPath?.rawKey
+        loadState = .loaded
         imageView.setImage(image, fitToWindow: true)
         window.title = url.lastPathComponent
         refreshStatus()
@@ -383,9 +405,12 @@ extension ImageWindowController: ImageNavigatorDelegate {
         currentIndex = index
         currentTotal = total
         currentURL = url
+        displayedKey = navigator.currentRawPath?.rawKey
+        loadState = .failed
+        // Clear the previous picture: it must not stay under the failed file's name
+        imageView.setImage(nil, fitToWindow: true)
         window.title = url.lastPathComponent
-        statusBar.update(index: index, total: total,
-                         filename: url.lastPathComponent, zoom: "— Error loading image —")
+        refreshStatus()
     }
 }
 

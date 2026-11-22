@@ -12,21 +12,31 @@ final class TerminalKeyReader {
         case zoomIn, zoomOut, resetZoom, fitToWindow
         case deleteFile
         case toggleGrid
-        case navigateDown
+        case navigateUp, navigateDown
         case confirmSelect
         case pan(dx: CGFloat, dy: CGFloat)
     }
 
+    /// Called on the main thread.
     var onAction: ((Action) -> Void)?
+
+    private static let fatalSignals = [SIGINT, SIGTERM, SIGQUIT]
 
     private var savedTermios = termios()
     private var source: DispatchSourceRead?
+    private var signalSources: [DispatchSourceSignal] = []
     private var rawModeEnabled = false
+
+    // Parser state, touched only on `queue`
+    private let queue = DispatchQueue(label: "imgdirview.tty", qos: .userInteractive)
+    private var pending: [UInt8] = []
+    private var flushTimer: DispatchWorkItem?
 
     func start() {
         guard isatty(STDIN_FILENO) != 0 else { return } // skip if not a real TTY
-
-        tcgetattr(STDIN_FILENO, &savedTermios)
+        // A background job that calls tcsetattr is stopped by SIGTTOU
+        guard tcgetpgrp(STDIN_FILENO) == getpgrp() else { return }
+        guard tcgetattr(STDIN_FILENO, &savedTermios) == 0 else { return }
         var raw = savedTermios
 
         // Disable canonical mode (line buffering) and echo
@@ -40,25 +50,34 @@ final class TerminalKeyReader {
             cc[Int(VTIME)] = 0
         }
 
-        tcsetattr(STDIN_FILENO, TCSANOW, &raw)
+        guard tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0 else { return }
         rawModeEnabled = true
+        installSignalHandlers()
 
-        // Watch stdin on a high-priority background queue
-        source = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO,
-                                               queue: .global(qos: .userInteractive))
-        source?.setEventHandler { [weak self] in
-            var buf = [UInt8](repeating: 0, count: 32)
-            let n = Darwin.read(STDIN_FILENO, &buf, 32)
-            guard n > 0 else { return }
-            self?.dispatch(bytes: Array(buf.prefix(n)))
+        let src = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: queue)
+        src.setEventHandler { [weak self, weak src] in
+            var buf = [UInt8](repeating: 0, count: 64)
+            let n = Darwin.read(STDIN_FILENO, &buf, buf.count)
+            if n > 0 {
+                self?.pending += buf.prefix(n)
+                self?.drain()
+            } else if n == 0 || (errno != EINTR && errno != EAGAIN) {
+                // EOF or a dead terminal: the source would otherwise fire forever
+                src?.cancel()
+            }
         }
-        source?.resume()
+        src.resume()
+        source = src
     }
 
+    /// Restore the terminal. Call on the main thread before the process exits.
     func stop() {
         source?.cancel()
         source = nil
+        for src in signalSources { src.cancel() }
+        signalSources = []
         if rawModeEnabled {
+            for sig in Self.fatalSignals { signal(sig, SIG_DFL) }
             tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
             rawModeEnabled = false
         }
@@ -66,63 +85,107 @@ final class TerminalKeyReader {
 
     deinit { stop() }
 
-    // MARK: - Parsing
-
-    private func dispatch(bytes: [UInt8]) {
-        guard let action = parse(bytes: bytes) else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.onAction?(action)
+    /// Ctrl+C and kill skip applicationWillTerminate, so the terminal is restored here
+    /// and the process then dies from the same signal with its default action.
+    private func installSignalHandlers() {
+        let saved = savedTermios
+        for sig in Self.fatalSignals {
+            signal(sig, SIG_IGN) // required for a dispatch signal source to receive it
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+            src.setEventHandler {
+                var t = saved
+                tcsetattr(STDIN_FILENO, TCSANOW, &t)
+                signal(sig, SIG_DFL)
+                kill(getpid(), sig)
+            }
+            src.resume()
+            signalSources.append(src)
         }
     }
 
-    private func parse(bytes: [UInt8]) -> Action? {
-        // Single-byte keys
-        if bytes.count == 1 {
-            switch bytes[0] {
-            case 0x1B:        return .quit           // Esc (lone — not part of a sequence)
-            case 0x7F:        return .deleteFile     // Backspace (DEL in terminal)
-            case 0x20:        return .toggleGrid     // Space
-            case 0x0D, 0x0A:  return .confirmSelect  // Enter / Return
-            case 0x2B, 0x3D:  return .zoomIn         // + or =
-            case 0x2D:        return .zoomOut        // -
-            case 0x6F, 0x4F:  return .resetZoom      // o / O
-            case 0x66, 0x46:  return .fitToWindow    // f / F
-            default:          return nil
+    // MARK: - Parsing
+
+    /// Split `pending` into keys. An incomplete tail (a lone ESC, half a sequence) waits
+    /// 50 ms for the rest, because a terminal or ssh can deliver one sequence in two reads.
+    private func drain() {
+        flushTimer?.cancel()
+        while let first = pending.first {
+            var len = 1
+            if first == 0x1B {
+                guard pending.count >= 2 else { break }
+                if pending[1] == 0x5B {
+                    // CSI: ESC [ parameters final-byte, where the final byte is 0x40...0x7E
+                    guard let end = pending.dropFirst(2).firstIndex(where: { (0x40...0x7E).contains($0) })
+                    else { break }
+                    len = end + 1
+                } else if pending[1] == 0x4F {
+                    // SS3: ESC O final-byte, sent for arrows, Home and End in application cursor mode
+                    guard pending.count >= 3 else { break }
+                    len = 3
+                } else {
+                    len = 2 // Alt+key
+                }
+            } else if first >= 0xC0 {
+                len = first >= 0xF0 ? 4 : first >= 0xE0 ? 3 : 2 // UTF-8 lead byte
+                guard pending.count >= len else { break }
+            }
+            let key = Array(pending.prefix(len))
+            pending.removeFirst(len)
+            if let action = parse(key) { emit(action) }
+        }
+        guard !pending.isEmpty else { return }
+
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Nothing followed: a lone ESC is the Esc key, anything else is discarded
+            if self.pending == [0x1B] { self.emit(.quit) }
+            self.pending.removeAll()
+        }
+        flushTimer = timer
+        queue.asyncAfter(deadline: .now() + .milliseconds(50), execute: timer)
+    }
+
+    private func emit(_ action: Action) {
+        // Deliver through the run loop, not DispatchQueue.main. A handler may open a modal
+        // alert; inside a main-queue block that would stall the main queue until the alert
+        // closes, and every key typed meanwhile would run afterwards. Through the run loop
+        // those keys arrive while the alert is up, and the handler drops them. A key already
+        // queued when the alert opened (same batch as the key that opened it) still runs
+        // after the alert closes.
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            self?.onAction?(action)
+        }
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
+    private func parse(_ key: [UInt8]) -> Action? {
+        // ESC [ … and ESC O … sequences
+        if key.count >= 3, key[0] == 0x1B {
+            switch String(decoding: key.dropFirst(2), as: UTF8.self) {
+            case "C":    return .nextImage             // → right
+            case "D":    return .previousImage         // ← left
+            case "A":    return .navigateUp            // ↑ up
+            case "B":    return .navigateDown          // ↓ down
+            case "3~":   return .deleteFile            // Forward Delete (fn+Backspace)
+            case "1;2A": return .pan(dx:   0, dy: -40) // Shift+↑
+            case "1;2B": return .pan(dx:   0, dy:  40) // Shift+↓
+            case "1;2C": return .pan(dx: -40, dy:   0) // Shift+→
+            case "1;2D": return .pan(dx:  40, dy:   0) // Shift+←
+            default:     return nil
             }
         }
 
-        // ESC [ … sequences (arrow keys)
-        if bytes.count >= 3, bytes[0] == 0x1B, bytes[1] == 0x5B {
-            // Plain arrows: ESC [ A/B/C/D
-            if bytes.count == 3 {
-                switch bytes[2] {
-                case 0x43: return .nextImage           // → right
-                case 0x44: return .previousImage       // ← left
-                case 0x41: return .toggleGrid          // ↑ up
-                case 0x42: return .navigateDown        // ↓ down
-                default:   return nil
-                }
-            }
-            // Forward Delete: ESC [ 3 ~  (fn+Backspace)
-            if bytes.count == 4, bytes[2] == 0x33, bytes[3] == 0x7E { return .deleteFile }
-            // Shift+arrows: ESC [ 1 ; 2 A/B/C/D
-            if bytes.count >= 6,
-               bytes[2] == 0x31, bytes[3] == 0x3B, bytes[4] == 0x32 {
-                switch bytes[5] {
-                case 0x41: return .pan(dx:   0, dy: -40) // Shift+↑
-                case 0x42: return .pan(dx:   0, dy:  40) // Shift+↓
-                case 0x43: return .pan(dx: -40, dy:   0) // Shift+→
-                case 0x44: return .pan(dx:  40, dy:   0) // Shift+←
-                default:   return nil
-                }
-            }
+        switch key {
+        case [0x7F]:                       return .deleteFile     // Backspace (DEL in terminal)
+        case [0x20]:                       return .toggleGrid     // Space
+        case [0x0D], [0x0A]:               return .confirmSelect  // Enter / Return
+        case [0x2B], [0x3D]:               return .zoomIn         // + or =
+        case [0x2D]:                       return .zoomOut        // -
+        // o / O, and щ / Щ: the same physical key in the Russian layout (keyCode 31 in the GUI)
+        case [0x6F], [0x4F], [0xD1, 0x89], [0xD0, 0xA9]: return .resetZoom
+        // f / F, and а / А: the same physical key in the Russian layout (keyCode 3 in the GUI)
+        case [0x66], [0x46], [0xD0, 0xB0], [0xD0, 0x90]: return .fitToWindow
+        default:                           return nil
         }
-
-        // Russian 'о' (U+043E, UTF-8 0xD0 0xBE) — same physical key as 'o'
-        if bytes.count == 2, bytes[0] == 0xD0, bytes[1] == 0xBE { return .resetZoom }
-        // Russian 'а' (U+0430, UTF-8 0xD0 0xB0) — same physical key as 'f'
-        if bytes.count == 2, bytes[0] == 0xD0, bytes[1] == 0xB0 { return .fitToWindow }
-
-        return nil
     }
 }

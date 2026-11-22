@@ -21,6 +21,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // terminate() ends in exit(), which runs no deinit: restore the terminal explicitly
+        windowController?.shutdown()
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }

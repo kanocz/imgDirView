@@ -15,6 +15,8 @@ final class ZoomableImageView: NSView {
 
     private var lastDragPoint: NSPoint?
 
+    private static let maxScale: CGFloat = 64
+
     // MARK: - Public interface
 
     var currentScaleInfo: String {
@@ -25,8 +27,9 @@ final class ZoomableImageView: NSView {
         }
     }
 
-    /// Load a new image. Pass fitToWindow = true to reset zoom/pan (navigation).
-    func setImage(_ image: NSImage, fitToWindow: Bool) {
+    /// Load a new image, or nil to clear the view.
+    /// Pass fitToWindow = true to reset zoom/pan (navigation).
+    func setImage(_ image: NSImage?, fitToWindow: Bool) {
         self.image = image
         if fitToWindow {
             isFitMode = true
@@ -40,22 +43,12 @@ final class ZoomableImageView: NSView {
 
     func zoomIn() {
         enterUserZoom()
-        userScale *= 1.25
-        clampOffset()
-        needsDisplay = true
-        onZoomChanged?()
+        applyUserScale(userScale * 1.25)
     }
 
     func zoomOut() {
         enterUserZoom()
-        userScale /= 1.25
-        // Snap back to fit mode when zoomed out past fit scale
-        if userScale <= fitScale {
-            isFitMode = true
-            panOffset = .zero
-        }
-        needsDisplay = true
-        onZoomChanged?()
+        applyUserScale(userScale / 1.25)
     }
 
     /// Restore fit-to-window mode (key "f")
@@ -153,14 +146,7 @@ final class ZoomableImageView: NSView {
 
     override func magnify(with event: NSEvent) {
         enterUserZoom()
-        userScale *= (1.0 + event.magnification)
-        if userScale <= fitScale {
-            isFitMode = true
-            panOffset = .zero
-        }
-        clampOffset()
-        needsDisplay = true
-        onZoomChanged?()
+        applyUserScale(userScale * (1.0 + event.magnification))
     }
 
     // MARK: - Private helpers
@@ -178,6 +164,20 @@ final class ZoomableImageView: NSView {
             userScale = fitScale
             isFitMode = false
         }
+    }
+
+    private func applyUserScale(_ scale: CGFloat) {
+        // Lower bound: fit-to-window for images larger than the view, 1:1 for smaller ones.
+        // Upper bound: maxScale, or the fit scale of a tiny image that already exceeds it.
+        userScale = min(max(scale, min(fitScale, 1)), max(Self.maxScale, fitScale))
+        // A large image zoomed out to its fit scale goes back to fit mode
+        if fitScale <= 1, userScale <= fitScale {
+            isFitMode = true
+            panOffset = .zero
+        }
+        clampOffset()
+        needsDisplay = true
+        onZoomChanged?()
     }
 
     private func clampOffset() {

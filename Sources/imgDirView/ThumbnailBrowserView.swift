@@ -70,13 +70,20 @@ final class ThumbnailBrowserView: NSView {
     private var rawPaths: [String] = []
     private var columnCount = 5
     private var selectedIndex = 0
-    private var thumbnails: [Int: NSImage] = [:]
-    private var loadingIndices = Set<Int>()
+    // Keyed by raw path, so entries stay valid when a deletion shifts indices
+    private var thumbnails: [Data: NSImage] = [:]
+    private var loadingPaths = Set<Data>()
+    private static let maxThumbnails = 500
 
     private let scrollView = NSScrollView()
     private var collectionView: NSCollectionView!
-    private let loadQueue = DispatchQueue(label: "imgdirview.thumbs", qos: .userInitiated,
-                                          attributes: .concurrent)
+    // Each load holds a whole file in memory and blocks on I/O: cap the parallelism
+    private let loadQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = ProcessInfo.processInfo.activeProcessorCount
+        q.qualityOfService = .userInitiated
+        return q
+    }()
 
     private static let cellID = NSUserInterfaceItemIdentifier("ThumbCell")
 
@@ -126,7 +133,7 @@ final class ThumbnailBrowserView: NSView {
         self.rawPaths = rawPaths
         self.selectedIndex = max(0, min(selectedIndex, rawPaths.count - 1))
         thumbnails = [:]
-        loadingIndices = []
+        loadingPaths = []
         collectionView.reloadData()
         updateLayout()
         DispatchQueue.main.async { self.selectAndReveal(self.selectedIndex) }
@@ -134,20 +141,10 @@ final class ThumbnailBrowserView: NSView {
 
     func removeItem(at index: Int) {
         guard index >= 0, index < rawPaths.count else { return }
+        thumbnails[rawPaths[index].rawKey] = nil
         rawPaths.remove(at: index)
 
-        var shifted: [Int: NSImage] = [:]
-        for (k, v) in thumbnails {
-            if k < index { shifted[k] = v }
-            else if k > index { shifted[k - 1] = v }
-        }
-        thumbnails = shifted
-        loadingIndices = Set(loadingIndices.compactMap { k -> Int? in
-            if k < index { return k }
-            if k > index { return k - 1 }
-            return nil
-        })
-
+        if index < selectedIndex { selectedIndex -= 1 }
         if !rawPaths.isEmpty {
             selectedIndex = max(0, min(selectedIndex, rawPaths.count - 1))
         }
@@ -223,48 +220,32 @@ final class ThumbnailBrowserView: NSView {
 
     private func loadThumbnail(at index: Int) {
         guard index >= 0, index < rawPaths.count else { return }
-        guard thumbnails[index] == nil, !loadingIndices.contains(index) else { return }
-        loadingIndices.insert(index)
         let raw = rawPaths[index]
+        let key = raw.rawKey
+        guard thumbnails[key] == nil, !loadingPaths.contains(key) else { return }
+        loadingPaths.insert(key)
 
-        loadQueue.async { [weak self] in
+        loadQueue.addOperation { [weak self] in
             let img = Self.makeThumbnail(rawPath: raw, maxDimension: 400)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.loadingIndices.remove(index)
-                guard index < self.rawPaths.count, self.rawPaths[index] == raw else { return }
-                self.thumbnails[index] = img ?? NSImage()
-                self.collectionView.reloadItems(at: [IndexPath(item: index, section: 0)])
+                self.loadingPaths.remove(key)
+                // A deletion may have shifted the item while it was loading
+                let item = index < self.rawPaths.count && self.rawPaths[index].rawKey == key
+                    ? index : self.rawPaths.firstIndex { $0.rawKey == key }
+                guard let item else { return }
+                // ponytail: crude bound, drops every thumbnail at the limit. Cells on screen keep
+                // their image and the rest reload on scroll. Switch to LRU if the reloads show.
+                if self.thumbnails.count >= Self.maxThumbnails { self.thumbnails.removeAll() }
+                self.thumbnails[key] = img ?? NSImage()
+                self.collectionView.reloadItems(at: [IndexPath(item: item, section: 0)])
             }
         }
     }
 
     private static func makeThumbnail(rawPath: String, maxDimension: Int) -> NSImage? {
-        let cfData: CFData? = rawPath.withCString { cPath -> CFData? in
-            let fd = Darwin.open(cPath, O_RDONLY)
-            guard fd >= 0 else { return nil }
-            defer { Darwin.close(fd) }
-
-            var st = Darwin.stat()
-            var bytes = Data()
-            if Darwin.fstat(fd, &st) == 0, st.st_size > 0 {
-                let sz = Int(st.st_size)
-                bytes = Data(count: sz)
-                let n = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, sz) }
-                if n != sz { bytes = Data() }
-            }
-            if bytes.isEmpty {
-                var buf = [UInt8](repeating: 0, count: 131_072)
-                while true {
-                    let n = Darwin.read(fd, &buf, 131_072)
-                    if n <= 0 { break }
-                    bytes.append(contentsOf: buf.prefix(n))
-                }
-            }
-            return bytes.isEmpty ? nil : (bytes as CFData)
-        }
-        guard let cfData,
-              let src = CGImageSourceCreateWithData(cfData, nil) else { return nil }
+        guard let data = RawFile.read(rawPath),
+              let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceThumbnailMaxPixelSize: maxDimension,
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -309,7 +290,7 @@ extension ThumbnailBrowserView: NSCollectionViewDataSource {
         let cell = collectionView.makeItem(withIdentifier: Self.cellID,
                                            for: indexPath) as! ThumbCell
         let idx = indexPath.item
-        cell.configure(image: thumbnails[idx],
+        cell.configure(image: thumbnails[rawPaths[idx].rawKey],
                        filename: (rawPaths[idx] as NSString).lastPathComponent)
         loadThumbnail(at: idx)
         return cell

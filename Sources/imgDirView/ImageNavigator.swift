@@ -2,8 +2,51 @@ import AppKit
 import Darwin
 
 protocol ImageNavigatorDelegate: AnyObject {
+    /// The file at `index` became current and is being read; the previous image is still on screen.
+    func navigator(willLoadAt index: Int, total: Int, url: URL)
     func navigator(didLoad image: NSImage, index: Int, total: Int, url: URL)
     func navigator(didFailAt index: Int, total: Int, url: URL)
+}
+
+/// Reads a regular file through POSIX calls on the raw path bytes (see ImageNavigator
+/// for why Foundation path APIs are avoided).
+enum RawFile {
+    /// Upper bound for one file held in memory.
+    static let maxSize = 1 << 30
+
+    static func read(_ rawPath: String) -> Data? {
+        // O_NONBLOCK: opening a FIFO returns at once instead of waiting for a writer
+        let fd = rawPath.withCString { Darwin.open($0, O_RDONLY | O_NONBLOCK) }
+        guard fd >= 0 else { return nil }
+        defer { Darwin.close(fd) }
+
+        // Regular files only: a symlink to /dev/zero or a FIFO named x.png never reaches EOF
+        var st = Darwin.stat()
+        guard Darwin.fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+
+        // st_size is only a capacity hint (NFS can report it stale); read until EOF
+        var data = Data()
+        data.reserveCapacity(min(max(Int(st.st_size), 0), maxSize))
+        var buf = [UInt8](repeating: 0, count: 1 << 20)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if n == 0 { break }
+            guard data.count + n <= maxSize else { return nil }
+            data.append(buf, count: n)
+        }
+        return data.isEmpty ? nil : data
+    }
+}
+
+extension String {
+    /// Byte-exact identity of a raw path, for dictionary keys and comparisons. String equality
+    /// is canonical ("й" in NFC equals "й" in NFD), so two files on NFS whose names differ
+    /// only in normalisation would otherwise share one cache entry.
+    var rawKey: Data { Data(utf8) }
 }
 
 /// Manages the list of images in a directory and their preloaded cache.
@@ -16,15 +59,19 @@ protocol ImageNavigatorDelegate: AnyObject {
 final class ImageNavigator {
     weak var delegate: ImageNavigatorDelegate?
 
+    // List state is touched only on the main thread.
     // urls[i] — for display only (AppKit/delegate)
     // rawPaths[i] — for POSIX I/O (preserves original NFC bytes)
     private var urls: [URL] = []
     private var rawPaths: [String] = []
-
     private var currentIndex: Int = 0
-    private var cache: [Int: NSImage] = [:]
-    private let loadQueue  = DispatchQueue(label: "imgdirview.load",  qos: .userInitiated)
-    private let cacheQueue = DispatchQueue(label: "imgdirview.cache", attributes: .concurrent)
+
+    // Decoded images keyed by raw path, so entries stay valid when a deletion shifts indices.
+    private var cache: [Data: NSImage] = [:]
+    // Raw paths within ±2 of the current position; a queued load outside it is skipped.
+    private var wanted: Set<Data> = []
+    private let cacheLock = NSLock() // guards cache and wanted
+    private let loadQueue = DispatchQueue(label: "imgdirview.load", qos: .userInitiated)
 
     private static let supportedExtensions: Set<String> = [
         "jpg", "jpeg", "png", "gif", "bmp",
@@ -44,7 +91,7 @@ final class ImageNavigator {
         let dirPath: String
         let targetName: String
         if let slashIdx = rawPath.lastIndex(of: "/") {
-            dirPath = String(rawPath[..<slashIdx])
+            dirPath = slashIdx == rawPath.startIndex ? "/" : String(rawPath[..<slashIdx])
             targetName = String(rawPath[rawPath.index(after: slashIdx)...])
         } else {
             dirPath = "."
@@ -75,11 +122,25 @@ final class ImageNavigator {
                 guard Self.supportedExtensions.contains(ext) else { continue }
 
                 // Build full raw path by string concatenation (no Foundation)
-                let fullRaw = dirPath + "/" + name
+                let fullRaw = (dirPath.hasSuffix("/") ? dirPath : dirPath + "/") + name
                 // URL is used only by AppKit/delegate — normalization here is harmless
                 let url = URL(fileURLWithPath: fullRaw)
                 found.append((raw: fullRaw, url: url))
             }
+        }
+
+        // The requested file is always in the list: its extension may be one the scan
+        // skips, or the scan itself may have failed (permissions).
+        // On a case-insensitive volume the name may be typed in another case than the scan
+        // returns it, so a byte-exact match is tried first and a case-insensitive one second.
+        // A directory argument ends with "/" (see main.swift) and has no target name: nothing
+        // is added for it, and the caller reports an empty list.
+        let name: (String) -> String = { ($0 as NSString).lastPathComponent }
+        var targetRaw = (found.first { name($0.raw).rawKey == targetName.rawKey }
+            ?? found.first { name($0.raw).caseInsensitiveCompare(targetName) == .orderedSame })?.raw
+        if targetRaw == nil, !targetName.isEmpty {
+            found.append((raw: rawPath, url: startURL))
+            targetRaw = rawPath
         }
 
         // Sort by filename using locale-aware comparison
@@ -90,25 +151,17 @@ final class ImageNavigator {
         }
 
         rawPaths = found.map { $0.raw }
-        urls      = found.map { $0.url }
-
-        if rawPaths.isEmpty {
-            // Directory scan failed (permissions, empty dir) — single-file fallback
-            rawPaths = [rawPath]
-            urls     = [startURL]
-            currentIndex = 0
-        } else {
-            currentIndex = rawPaths.firstIndex(where: {
-                ($0 as NSString).lastPathComponent == targetName
-            }) ?? 0
-        }
+        urls     = found.map { $0.url }
+        currentIndex = targetRaw.flatMap { target in
+            rawPaths.firstIndex { $0.rawKey == target.rawKey }
+        } ?? 0
     }
 
-    // MARK: - Public API
+    // MARK: - Public API (main thread only)
 
     var count: Int { rawPaths.count }
     var index: Int { currentIndex }
-    var currentRawPath: String? { rawPaths.isEmpty ? nil : rawPaths[currentIndex] }
+    var currentRawPath: String? { rawPaths.indices.contains(currentIndex) ? rawPaths[currentIndex] : nil }
     var allRawPaths: [String] { rawPaths }
 
     func jumpTo(index: Int) {
@@ -116,29 +169,36 @@ final class ImageNavigator {
         currentIndex = index
     }
 
-    /// Remove the file at a given index. Does NOT call loadCurrent() — caller is responsible.
-    /// Returns false if the list is now empty.
+    /// Drop the entry at `index` (call after the file was trashed or deleted). The current
+    /// position stays on the same file, or moves to its successor when the current file
+    /// itself was removed. Does NOT call loadCurrent(). Returns false if the list is now empty.
     @discardableResult
     func removeAt(index: Int) -> Bool {
         guard index >= 0, index < rawPaths.count else { return !rawPaths.isEmpty }
         rawPaths.remove(at: index)
         urls.remove(at: index)
-        cacheQueue.async(flags: .barrier) { self.cache = [:] }
-        if currentIndex >= rawPaths.count { currentIndex = max(0, rawPaths.count - 1) }
+        if index < currentIndex { currentIndex -= 1 }
+        currentIndex = min(currentIndex, max(0, rawPaths.count - 1))
         return !rawPaths.isEmpty
     }
 
     func loadCurrent() {
-        let idx = currentIndex
-        load(index: idx) { [weak self] image in
+        guard let raw = currentRawPath else { return }
+        let key = raw.rawKey
+        trimCache()
+        if cachedImage(key) == nil {
+            delegate?.navigator(willLoadAt: currentIndex, total: count, url: urls[currentIndex])
+        }
+        load(rawPath: raw) { [weak self] image in
             guard let self else { return }
+            // Drop results for a file that is no longer current (user moved on, or it was deleted)
+            guard self.currentRawPath?.rawKey == key else { return }
+            let idx = self.currentIndex
             let url = self.urls[idx]
-            DispatchQueue.main.async {
-                if let image {
-                    self.delegate?.navigator(didLoad: image, index: idx, total: self.count, url: url)
-                } else {
-                    self.delegate?.navigator(didFailAt: idx, total: self.count, url: url)
-                }
+            if let image {
+                self.delegate?.navigator(didLoad: image, index: idx, total: self.count, url: url)
+            } else {
+                self.delegate?.navigator(didFailAt: idx, total: self.count, url: url)
             }
             self.preload(index: idx + 1)
             self.preload(index: idx - 1)
@@ -157,90 +217,49 @@ final class ImageNavigator {
         loadCurrent()
     }
 
-    /// Remove the current file from the list (call after successful trash/delete)
-    /// and load the new current image. Returns false if the list is now empty.
-    @discardableResult
-    func removeCurrentAndLoad() -> Bool {
-        guard !rawPaths.isEmpty else { return false }
-        rawPaths.remove(at: currentIndex)
-        urls.remove(at: currentIndex)
-        // All cache indices have shifted — simplest fix is to clear entirely
-        cacheQueue.async(flags: .barrier) { self.cache = [:] }
-        guard !rawPaths.isEmpty else { return false }
-        if currentIndex >= rawPaths.count { currentIndex = rawPaths.count - 1 }
-        loadCurrent()
-        return true
-    }
-
     // MARK: - Private loading
 
-    private func load(index: Int, completion: @escaping (NSImage?) -> Void) {
-        guard index >= 0, index < rawPaths.count else { completion(nil); return }
+    private func cachedImage(_ key: Data) -> NSImage? {
+        cacheLock.withLock { cache[key] }
+    }
 
-        cacheQueue.sync {
-            if let img = self.cache[index] { completion(img); return }
+    /// Keep only images within ±2 of the current position and publish that window to the loader.
+    private func trimCache() {
+        guard !rawPaths.isEmpty else { return }
+        let lo = max(0, currentIndex - 2)
+        let hi = min(rawPaths.count - 1, currentIndex + 2)
+        let keep = Set(rawPaths[lo...hi].map(\.rawKey))
+        cacheLock.withLock {
+            wanted = keep
+            cache = cache.filter { keep.contains($0.key) }
         }
+    }
+
+    /// Call on the main thread. Completion also runs on the main thread:
+    /// synchronously on a cache hit, asynchronously otherwise. It is not called at all
+    /// for a request that went stale in the queue (its file left the ±2 window).
+    private func load(rawPath: String, completion: @escaping (NSImage?) -> Void) {
+        let key = rawPath.rawKey
+        if let image = cachedImage(key) { completion(image); return }
 
         loadQueue.async { [weak self] in
             guard let self else { return }
-
-            var cached: NSImage?
-            self.cacheQueue.sync { cached = self.cache[index] }
-            if let cached { completion(cached); return }
-
-            let raw = self.rawPaths[index]
-            guard let image = Self.readImage(rawPath: raw) else {
-                completion(nil)
-                return
+            // An earlier queued request for the same file may have filled the cache meanwhile
+            let (cached, isWanted) = self.cacheLock.withLock {
+                (self.cache[key], self.wanted.contains(key))
             }
-
-            self.cacheQueue.async(flags: .barrier) {
-                self.cache[index] = image
-                let keep = Set((self.currentIndex - 2)...(self.currentIndex + 2))
-                self.cache = self.cache.filter { keep.contains($0.key) }
-            }
-            completion(image)
-        }
-    }
-
-    /// Open and read an image file using raw POSIX calls with the original NFC path bytes.
-    private static func readImage(rawPath: String) -> NSImage? {
-        // Use withCString: Swift converts the String to UTF-8 bytes WITHOUT
-        // any Unicode normalisation — the same bytes the NFS kernel path lookup uses.
-        return rawPath.withCString { cPath -> NSImage? in
-            let fd = Darwin.open(cPath, O_RDONLY)
-            guard fd >= 0 else { return nil }
-            defer { Darwin.close(fd) }
-
-            // fstat for a single-allocation read
-            var st = Darwin.stat()
-            var data = Data()
-
-            if Darwin.fstat(fd, &st) == 0, st.st_size > 0 {
-                let size = Int(st.st_size)
-                data = Data(count: size)
-                let n = data.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, size) }
-                if n != size { data = Data() } // partial read → fall through to chunked
-            }
-
-            // Chunked fallback (NFS fstat size unreliable, or partial read above)
-            if data.isEmpty {
-                let chunk = 131072
-                var buf = [UInt8](repeating: 0, count: chunk)
-                while true {
-                    let n = Darwin.read(fd, &buf, chunk)
-                    if n <= 0 { break }
-                    data.append(contentsOf: buf.prefix(n))
-                }
-            }
-
-            guard !data.isEmpty else { return nil }
-            return NSImage(data: data)
+            // The user moved on (a held arrow key on a slow disk queues one read per file):
+            // skip the read so the queue drains. loadCurrent() puts the current file into
+            // the window before it queues the request, so that request is never skipped.
+            guard isWanted else { return }
+            let image = cached ?? RawFile.read(rawPath).flatMap { NSImage(data: $0) }
+            if let image { self.cacheLock.withLock { self.cache[key] = image } }
+            DispatchQueue.main.async { completion(image) }
         }
     }
 
     private func preload(index: Int) {
         guard index >= 0, index < rawPaths.count else { return }
-        load(index: index) { _ in }
+        load(rawPath: rawPaths[index]) { _ in }
     }
 }

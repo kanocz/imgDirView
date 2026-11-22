@@ -76,6 +76,7 @@ cp .build/release/imgDirView /usr/local/bin/
 imgDirView photo.jpg
 imgDirView /path/to/image.png
 imgDirView "Фото с отпуска.heic"   # Unicode filenames work fine
+imgDirView /path/to/folder          # starts at the first image in the folder
 ```
 
 ### Midnight Commander integration
